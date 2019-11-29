@@ -10,3 +10,6 @@ license = "MIT OR Apache-2.0 OR Zlib"
 edition = "2018"
 
 [dependencies]
+ash = "0.29"
+vk-mem = "0.2"
+generational-arena = "0.2"
