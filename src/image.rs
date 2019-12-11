@@ -91,7 +91,7 @@ pub fn mip_levels_from_extent(extent: vk::Extent3D) -> u32 {
     levels
 }
 
-/// Extract format features from image usage.
+/// Extract vk::FormatFeatureFlag from given vk::ImageUsageFlags
 pub fn image_usage_to_features(usage: vk::ImageUsageFlags) -> vk::FormatFeatureFlags {
     let mut flags = vk::FormatFeatureFlags::empty();
 
@@ -111,33 +111,40 @@ pub fn image_usage_to_features(usage: vk::ImageUsageFlags) -> vk::FormatFeatureF
     flags
 }
 
-/*
-static inline VkPipelineStageFlags image_usage_to_possible_stages(VkImageUsageFlags usage)
+/// Get all possible vk::PipelineStageFlags from a given vk::ImageUsageFlags
+pub fn image_usage_to_possible_stages(usage: vk::ImageUsageFlags) -> vk::PipelineStageFlags
 {
-    VkPipelineStageFlags flags = 0;
+    let mut flags = vk::PipelineStageFlags::empty();
 
-    if (usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
-        flags |= VK_PIPELINE_STAGE_TRANSFER_BIT;
-    if (usage & VK_IMAGE_USAGE_SAMPLED_BIT)
-        flags |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    if (usage & VK_IMAGE_USAGE_STORAGE_BIT)
-        flags |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    if (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
-        flags |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    if (usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
-        flags |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    if (usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)
-        flags |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    if !(usage & (vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)).is_empty() {
+        flags |= vk::PipelineStageFlags::TRANSFER;
+    }
+    if !(usage & vk::ImageUsageFlags::SAMPLED).is_empty() {
+        flags |= vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::VERTEX_SHADER |
+                 vk::PipelineStageFlags::FRAGMENT_SHADER;
+    }
+    if !(usage & vk::ImageUsageFlags::STORAGE).is_empty() {
+        flags |= vk::PipelineStageFlags::COMPUTE_SHADER;
+    }
+    if !(usage & vk::ImageUsageFlags::COLOR_ATTACHMENT).is_empty() {
+        flags |= vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
+    }
+    if !(usage & vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT).is_empty() {
+        flags |= vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS;
+    }
+    if !(usage & vk::ImageUsageFlags::INPUT_ATTACHMENT).is_empty() {
+        flags |= vk::PipelineStageFlags::FRAGMENT_SHADER;
+    }
 
-    if (usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)
+    if !(usage & vk::ImageUsageFlags::TRANSIENT_ATTACHMENT).is_empty()
     {
-        VkPipelineStageFlags possible = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                                        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        let mut possible = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT |
+            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS |
+            vk::PipelineStageFlags::LATE_FRAGMENT_TESTS;
 
-        if (usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)
-            possible |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        if !(usage & vk::ImageUsageFlags::INPUT_ATTACHMENT).is_empty() {
+            possible |= vk::PipelineStageFlags::FRAGMENT_SHADER;
+        }
 
         flags &= possible;
     }
@@ -145,52 +152,58 @@ static inline VkPipelineStageFlags image_usage_to_possible_stages(VkImageUsageFl
     return flags;
 }
 
-static inline VkAccessFlags image_layout_to_possible_access(VkImageLayout layout)
+/// Get all possible vk::AccessFlags from a given vk::ImageLayout
+pub fn image_layout_to_possible_access(layout: vk::ImageLayout) -> vk::AccessFlags
 {
-    switch (layout)
+    match layout
     {
-    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-        return VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
-    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-        return VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
-        return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
-        return VK_ACCESS_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-        return VK_ACCESS_TRANSFER_READ_BIT;
-    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-        return VK_ACCESS_TRANSFER_WRITE_BIT;
-    default:
-        return ~0u;
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL =>
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::INPUT_ATTACHMENT_READ,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL =>
+            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL =>
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        vk::ImageLayout::DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL =>
+            vk::AccessFlags::INPUT_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL =>
+            vk::AccessFlags::TRANSFER_READ,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL =>
+            vk::AccessFlags::TRANSFER_WRITE,
+        _ => vk::AccessFlags::empty()
     }
 }
 
-static inline VkAccessFlags image_usage_to_possible_access(VkImageUsageFlags usage)
+/// Get possible vk::AccessFlags from a given vk::ImageUsageFlags
+pub fn image_usage_to_possible_access(usage: vk::ImageUsageFlags) -> vk::AccessFlags
 {
-    VkAccessFlags flags = 0;
+    let mut flags = vk::AccessFlags::empty();
 
-    if (usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
-        flags |= VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    if (usage & VK_IMAGE_USAGE_SAMPLED_BIT)
-        flags |= VK_ACCESS_SHADER_READ_BIT;
-    if (usage & VK_IMAGE_USAGE_STORAGE_BIT)
-        flags |= VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-    if (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
-        flags |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-    if (usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
-        flags |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-    if (usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)
-        flags |= VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+    if !(usage & (vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)).is_empty() {
+        flags |= vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE;
+    }
+    if !(usage & vk::ImageUsageFlags::SAMPLED).is_empty() {
+        flags |= vk::AccessFlags::SHADER_READ;
+    }
+    if !(usage & vk::ImageUsageFlags::STORAGE).is_empty() {
+        flags |= vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE;
+    }
+    if !(usage & vk::ImageUsageFlags::COLOR_ATTACHMENT).is_empty() {
+        flags |= vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE;
+    }
+    if !(usage & vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT).is_empty() {
+        flags |= vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE;
+    }
+    if !(usage & vk::ImageUsageFlags::INPUT_ATTACHMENT).is_empty() {
+        flags |= vk::AccessFlags::INPUT_ATTACHMENT_READ;
+    }
 
     // Transient attachments can only be attachments, and never other resources.
-    if (usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)
+    if !(usage & vk::ImageUsageFlags::TRANSIENT_ATTACHMENT).is_empty()
     {
-        flags &= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                 VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+        flags &= vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE |
+                 vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE |
+                 vk::AccessFlags::INPUT_ATTACHMENT_READ;
     }
 
-    return flags;
+    flags
 }
-*/
