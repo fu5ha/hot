@@ -2,30 +2,23 @@ pub use ash::vk;
 
 use generational_arena as ga;
 
+use std::ptr::NonNull;
+
 /// The general memory 'domain' a buffer should be placed in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum BufferUsageDomain {
     /// Memory which is located on the graphics device (i.e. GPU). Will be fast for
-    /// access on the device, but the CPU cannot access this memory.
-    GpuOnly,
+    /// access on the device, but the CPU may not be able to access this memory directly.
+    Device,
+    /// Memory which is located on the graphics device (i.e. GPU). Prefers to be put in
+    /// memory which is directly mappable from the host, but may not be.
+    DeviceDynamic,
     /// Memory which is located on the host (i.e. CPU), and which is accessible
     /// by the GPU, but said access is probably slow.
     ///
-    /// This type of buffer is
-    /// usually used as a 'staging' or 'upload' buffer to copy data into a faster
-    /// final `GpuOnly` buffer.
-    Upload,
-    /// Memory which is mappable on the CPU and is also preferrably fast to access
-    /// on the GPU.
-    ///
-    /// Intended for use with data that is relatively small and changes frequently on the CPU,
-    /// such as uniform, vertex, or texture data which is updated on every frame or draw call.
-    ///
-    /// This domain will be effective mostly for integrated and mobile GPUs,
-    /// and some AMD GPUs which present some memory types that are CPU mappable but are also
-    /// fast to access on the GPU, while on other platforms it will fall back to regular `Upload`
-    /// memory.
-    Dynamic,
+    /// This type of buffer is usually used as a 'staging' or 'upload' buffer to copy data
+    /// into a faster final `Device` buffer.
+    Host,
     /// Memory which is mappable on host and cached.
     ///
     /// Intended use is to suppor readback operations for data that was computed on the GPU.
@@ -46,16 +39,45 @@ pub struct BufferCreateInfo {
 /// Handle to a GPU Buffer.
 #[derive(Clone, Copy, Debug)]
 pub struct Buffer {
-    idx: ga::Index,
+    pub(crate) idx: ga::Index,
 }
 
 /// An owned `vk::Buffer` and some associated information.
 #[derive(Debug)]
 pub struct OwnedBuffer {
-    buffer: vk::Buffer,
-    allocation: vk_mem::Allocation,
-    allocation_info: vk_mem::AllocationInfo,
-    create_info: BufferCreateInfo,
+    pub(crate) buffer: vk::Buffer,
+    pub(crate) allocation: vk_mem::Allocation,
+    pub(crate) allocation_info: vk_mem::AllocationInfo,
+    pub(crate) create_info: BufferCreateInfo,
+    pub(crate) mapped_data: Option<NonNull<u8>>,
+}
+
+impl OwnedBuffer {
+    /// The raw `vk::Buffer`
+    pub fn raw(&self) -> vk::Buffer {
+        self.buffer
+    }
+
+    /// The raw `vk_mem::Allocation`
+    pub fn allocation(&self) -> &vk_mem::Allocation {
+        &self.allocation
+    }
+
+    /// The `vk_mem::AllocationInfo` used to create this Buffer.
+    pub fn allocation_info(&self) -> &vk_mem::AllocationInfo {
+        &self.allocation_info
+    }
+
+    /// The BufferCreateInfo used to create this Buffer.
+    pub fn create_info(&self) -> BufferCreateInfo {
+        self.create_info
+    }
+
+    /// A NonNull pointer to the CPU mapped data of this Buffer, if
+    /// it exists.
+    pub fn mapped_data(&mut self) -> Option<&mut NonNull<u8>> {
+        self.mapped_data.as_mut()
+    }
 }
 
 impl Drop for OwnedBuffer {
