@@ -108,7 +108,7 @@ impl OwnedBuffer {
     }
 
     /// Destroy this buffer.
-    pub fn destroy(self, device: &mut Device) -> Result<(), vk_mem::Error> {
+    pub fn destroy(self, device: &Device) -> Result<(), vk_mem::Error> {
         device.raw_allocator().destroy_buffer(self.buffer, &self.allocation)?;
         self.nodrop.destroy();
         Ok(())

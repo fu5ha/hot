@@ -15,6 +15,7 @@ struct PerFrame {
     used_vbo_blocks: Vec<VertexBlock>,
     used_ibo_blocks: Vec<IndexBlock>,
     used_ubo_blocks: Vec<UniformBlock>,
+    used_staging_blocks: Vec<StagingBlock>,
 }
 
 /// The Device. Owns and manages resources, submission, etc.
@@ -35,9 +36,10 @@ pub struct Device {
     resources: ResourcePool,
     per_frame: Vec<PerFrame>,
 
-    vbo_ring: BufferBlockPool,
-    ibo_ring: BufferBlockPool,
-    ubo_ring: BufferBlockPool,
+    vbo_pool: BufferBlockPool,
+    ibo_pool: BufferBlockPool,
+    ubo_pool: BufferBlockPool,
+    staging_pool: BufferBlockPool,
 }
 
 impl Device {
