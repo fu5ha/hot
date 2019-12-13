@@ -29,3 +29,8 @@ pub mod format;
 /// A Device wrapper, the central type which creates, owns, and manages other resources.
 pub mod device;
 pub use device::*;
+
+mod util;
+/// A type that panics on Drop and requires manual destruction.
+pub mod nodrop;
+pub use nodrop::*;

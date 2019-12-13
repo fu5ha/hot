@@ -4,6 +4,8 @@ use generational_arena as ga;
 
 use std::ptr::NonNull;
 
+use crate::{Device, NoDrop, Tag};
+
 /// The general memory 'domain' a buffer should be placed in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum BufferUsageDomain {
@@ -43,6 +45,8 @@ pub struct Buffer {
 }
 
 /// An owned `vk::Buffer` and some associated information.
+///
+/// Must not be simply Dropped, but rather destroyed manually.
 #[derive(Debug)]
 pub struct OwnedBuffer {
     pub(crate) buffer: vk::Buffer,
@@ -50,9 +54,33 @@ pub struct OwnedBuffer {
     pub(crate) allocation_info: vk_mem::AllocationInfo,
     pub(crate) create_info: BufferCreateInfo,
     pub(crate) mapped_data: Option<NonNull<u8>>,
+    pub(crate) nodrop: NoDrop,
 }
 
 impl OwnedBuffer {
+    /// Create a new OwnedBuffer.
+    pub fn new(
+        buffer: vk::Buffer,
+        allocation: vk_mem::Allocation,
+        allocation_info: vk_mem::AllocationInfo,
+        create_info: BufferCreateInfo,
+        mapped_data: Option<NonNull<u8>>,
+        tag: Option<Tag>,
+    ) -> Self {
+        Self {
+            buffer,
+            allocation,
+            allocation_info,
+            create_info,
+            mapped_data,
+            nodrop: if let Some(tag) = tag {
+                NoDrop::new(tag)
+            } else {
+                NoDrop::from_str("Generic OwnedBuffer")
+            },
+        }
+    }
+
     /// The raw `vk::Buffer`
     pub fn raw(&self) -> vk::Buffer {
         self.buffer
@@ -78,11 +106,12 @@ impl OwnedBuffer {
     pub fn mapped_data(&mut self) -> Option<&mut NonNull<u8>> {
         self.mapped_data.as_mut()
     }
-}
 
-impl Drop for OwnedBuffer {
-    fn drop(&mut self) {
-        panic!("OwnedBuffer dropped: {:?}", self);
+    /// Destroy this buffer.
+    pub fn destroy(self, device: &mut Device) -> Result<(), vk_mem::Error> {
+        device.raw_allocator().destroy_buffer(self.buffer, &self.allocation)?;
+        self.nodrop.destroy();
+        Ok(())
     }
 }
 
@@ -106,15 +135,10 @@ pub struct BufferView {
 /// An owned `vk::BufferView` and some associated information.
 #[derive(Debug)]
 pub struct OwnedBufferView {
-    buffer: Buffer,
-    view: vk::BufferView,
-    create_info: BufferViewCreateInfo,
-}
-
-impl Drop for OwnedBufferView {
-    fn drop(&mut self) {
-        panic!("OwnedBufferView dropped: {:?}", self);
-    }
+    pub(crate) buffer: Buffer,
+    pub(crate) view: vk::BufferView,
+    pub(crate) create_info: BufferViewCreateInfo,
+    pub(crate) nodrop: NoDrop,
 }
 
 /// Get all possible `vk::PipelineStageFlags` given a set of `vk::BufferUsageFlags`.
