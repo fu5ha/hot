@@ -5,7 +5,6 @@ use generational_arena as ga;
 use thiserror::Error;
 
 use crate::{OwnedBuffer, BufferCreateInfo, BufferUsageDomain, Device, NoDrop, Tag};
-use crate::util::typed_resource_wrapper;
 
 use std::sync::atomic::AtomicUsize;
 
@@ -205,26 +204,6 @@ pub struct BufferBlock {
     idx: ga::Index,
 }
 
-typed_resource_wrapper! {
-    /// A typed BufferBlock representing a vertex buffer. See also the docs for BufferBlock.
-    pub struct VertexBlock(BufferBlock);
-}
-
-typed_resource_wrapper! {
-    /// A typed BufferBlock representing an index buffer. See also the docs for BufferBlock.
-    pub struct IndexBlock(BufferBlock);
-}
-
-typed_resource_wrapper! {
-    /// A typed BufferBlock representing a uniformertex buffer. See also the docs for BufferBlock.
-    pub struct UniformBlock(BufferBlock);
-}
-
-typed_resource_wrapper! {
-    /// A typed BufferBlock representing a staging buffer. See also the docs for BufferBlock.
-    pub struct StagingBlock(BufferBlock);
-}
-
 /// A pool of BufferBlocks with the same `vk::BufferUsageFlags`.
 ///
 /// Blocks will attempt to be recycled and reused according to the description in `new`.
@@ -282,11 +261,7 @@ impl BufferBlockPool {
 
         let gpu_memory_type_index = device.find_memory_type_index_for_buffer_info(create_info)?;
 
-        let physical_device_memory_properties = device.get_physical_device_memory_properties();
-        
-        let ty = physical_device_memory_properties.memory_types[gpu_memory_type_index as usize];
-
-        let cpu_memory_type_index = if !ty.property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
+        let cpu_memory_type_index = if !device.is_memory_type_host_visible(gpu_memory_type_index) {
             let create_info = BufferCreateInfo {
                 domain: BufferUsageDomain::Host,
                 size: block_size as _,
@@ -337,7 +312,7 @@ impl BufferBlockPool {
     /// * `min_size`: The minimum size that must be allocated for the block.
     pub fn request_block(
         &mut self,
-        device: &Device,
+        allocator: &vk_mem::Allocator,
         min_size: usize,
         tag: Option<Tag>,
     ) -> Result<BufferBlock, vk_mem::Error> {
@@ -356,7 +331,7 @@ impl BufferBlockPool {
             }
         }
 
-        self.allocate_block(device, min_size, tag)
+        self.allocate_block(allocator, min_size, tag)
     }
 
     /// Allocate a new BufferBlock from the pool. Will not attempt to reuse a previously allocated recycled Block.
@@ -366,7 +341,7 @@ impl BufferBlockPool {
     /// * `min_size`: The minimum size that must be allocated for the block.
     pub fn allocate_block(
         &mut self,
-        device: &Device,
+        allocator: &vk_mem::Allocator,
         min_size: usize,
         tag: Option<Tag>,
     ) -> Result<BufferBlock, vk_mem::Error> {
@@ -385,12 +360,12 @@ impl BufferBlockPool {
             ..Default::default()
         };
 
-        let gpu = device.raw_allocator().create_pool(&pool_info)?;
+        let gpu = allocator.create_pool(&pool_info)?;
 
         let cpu = if let Some(cpu_memory_type_index) = self.cpu_memory_type_index {
             pool_info.memory_type_index = cpu_memory_type_index;
 
-            Some(device.raw_allocator().create_pool(&pool_info)?)
+            Some(allocator.create_pool(&pool_info)?)
         } else {
             None
         };

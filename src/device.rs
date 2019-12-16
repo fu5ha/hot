@@ -5,17 +5,16 @@ use std::ops::{Deref};
 
 use crate::*;
 use resource::ResourcePool;
-use buffer_block::{VertexBlock, IndexBlock, UniformBlock};
 
 struct PerFrame {
     graphics_cmd_pools: Vec<CommandPool>,
     compute_cmd_pools: Vec<CommandPool>,
     transfer_cmd_pools: Vec<CommandPool>,
 
-    used_vbo_blocks: Vec<VertexBlock>,
-    used_ibo_blocks: Vec<IndexBlock>,
-    used_ubo_blocks: Vec<UniformBlock>,
-    used_staging_blocks: Vec<StagingBlock>,
+    used_vbo_blocks: Vec<BufferBlock>,
+    used_ibo_blocks: Vec<BufferBlock>,
+    used_ubo_blocks: Vec<BufferBlock>,
+    used_staging_blocks: Vec<BufferBlock>,
 }
 
 /// The Device. Owns and manages resources, submission, etc.
@@ -33,6 +32,8 @@ pub struct Device {
     transfer_queue_family_index: u32,
     multiple_queue_families: bool,
 
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+
     resources: ResourcePool,
     per_frame: Vec<PerFrame>,
 
@@ -43,6 +44,56 @@ pub struct Device {
 }
 
 impl Device {
+    /// Request a BufferBlock which will allocate buffers that may be used as vertex buffers.
+    ///
+    /// The BufferBlock will be automatically recycled or destroyed the next time this frame
+    /// begins.
+    pub fn request_vertex_block(
+        &mut self,
+        size: usize,
+        tag: Option<Tag>
+    ) -> Result<BufferBlock, vk_mem::Error> {
+        self.vbo_pool.request_block(&self.allocator, size, tag)
+    }
+
+    /// Request a BufferBlock which will allocate buffers that may be used as index buffers.
+    ///
+    /// The BufferBlock will be automatically recycled or destroyed the next time this frame
+    /// begins.
+    pub fn request_index_block(
+        &mut self,
+        size: usize,
+        tag: Option<Tag>
+    ) -> Result<BufferBlock, vk_mem::Error> {
+        self.ibo_pool.request_block(&self.allocator, size, tag)
+    }
+
+    /// Request a BufferBlock which will allocate buffers that may be used as uniform buffers.
+    ///
+    /// The BufferBlock will be automatically recycled or destroyed the next time this frame
+    /// begins.
+    pub fn request_uniform_block(
+        &mut self,
+        size: usize,
+        tag: Option<Tag>
+    ) -> Result<BufferBlock, vk_mem::Error> {
+        self.ubo_pool.request_block(&self.allocator, size, tag)
+    }
+
+    /// Request a BufferBlock which will allocate buffers that may be used as staging buffers,
+    /// i.e. buffers with TRANSFER_SRC usage whose data may be copied to a persistent GPU side
+    /// buffer.
+    ///
+    /// The BufferBlock will be automatically recycled or destroyed the next time this frame
+    /// begins.
+    pub fn request_staging_block(
+        &mut self,
+        size: usize,
+        tag: Option<Tag>
+    ) -> Result<BufferBlock, vk_mem::Error> {
+        self.staging_pool.request_block(&self.allocator, size, tag)
+    }
+
     /// Get the raw `vk_mem::Allocator`.
     pub fn raw_allocator(&self) -> &vk_mem::Allocator {
         &self.allocator
@@ -53,12 +104,42 @@ impl Device {
         unsafe { self.instance.get_physical_device_memory_properties(self.physical_device) }
     }
 
-    /// Create a Buffer from a BufferCreateInfo
-    pub fn create_buffer(
+    /// Find whether a certain memory type index is visible to the cpu, i.e. able to be mapped.
+    pub fn is_memory_type_host_visible(&self, type_index: u32) -> bool {
+        let ty = self.memory_properties.memory_types[type_index as usize];
+
+        ty.property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) 
+    }
+
+    /// Find whether a certain memory type index is device local, i.e. fast for on-device access.
+    pub fn is_memory_type_device_local(&self, type_index: u32) -> bool {
+        let ty = self.memory_properties.memory_types[type_index as usize];
+
+        ty.property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) 
+    }
+
+
+    /// Create a Buffer from a BufferCreateInfo and, optionally, upload some
+    /// initial data to it.
+    ///
+    /// Depending on the type of memory that the buffer gets allocated in,
+    /// the initial data will either be directly copied into the cpu-mappable
+    /// buffer, or will be uploaded automatically via a staging buffer.
+    ///
+    /// If `initial_data` exists, `size_of::<T>` must be <= to `create_info.size`.
+    pub fn create_buffer<T>(
         &mut self,
-        create_info: BufferCreateInfo,
+        mut create_info: BufferCreateInfo,
         tag: Option<Tag>,
+        initial_data: Option<T>
     ) -> Result<Buffer, vk_mem::Error> {
+        if initial_data.is_some() {
+            assert!(core::mem::size_of::<T>() as vk::DeviceSize <= create_info.size);
+        }
+
+        if create_info.domain != BufferUsageDomain::Host {
+            create_info.usage |= vk::BufferUsageFlags::TRANSFER_DST;
+        }
         let mut queue_family_indices = [0u32; 3];
         let buffer_info = self.raw_buffer_create_info(create_info, &mut queue_family_indices);
         let alloc_info = self.allocation_info_from_buffer_create_info(create_info);
@@ -68,7 +149,7 @@ impl Device {
 
         let mapped_data = std::ptr::NonNull::new(allocation_info.get_mapped_data());
 
-        Ok(Buffer {
+        let handle = Buffer {
             idx: self
                 .resources
                 .buffers
@@ -78,10 +159,39 @@ impl Device {
                     allocation_info,
                     create_info,
                     mapped_data,
-                    tag,
+                    tag.clone(),
                 )),
-        })
+        };
+
+        if let Some(initial_data) = initial_data {
+            if let Some(mapped) = mapped_data {
+                let mut mapped = mapped.cast::<T>();
+                unsafe {
+                    *mapped.as_mut() = initial_data;
+                }
+            }
+        } else {
+            let mut staging_info = create_info;
+            staging_info.domain = BufferUsageDomain::Host;
+            staging_info.usage &= !vk::BufferUsageFlags::TRANSFER_DST;
+            staging_info.usage |= vk::BufferUsageFlags::TRANSFER_SRC;
+
+            let staging_buffer = self.create_buffer(staging_info, tag.clone(), initial_data);
+
+            // TODO
+            // let cmd_buf = self.request_commad_buffer(CommandBuffer::Type::AsyncTransfer);
+            // cmd_buf.copy_buffer(staging_buffer, handle);
+
+            // self.submit_staging(cmd_buf, staging_info.usage, true);
+            // self.used_staging_buffer(staging_buffer);
+        }
+
+        Ok(handle)
     }
+
+    // pub fn used_staging_buffer(&mut self, buffer: Buffer) {
+
+    // }
 
     /// A helper function to find a usable memory type index given an example BufferInfo for
     /// a buffer to be allocated.
