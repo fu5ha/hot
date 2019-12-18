@@ -1,20 +1,21 @@
 use ash::vk;
-use ash::version::InstanceV1_0;
+
+use parking_lot::*;
 
 use std::ops::{Deref};
+use std::sync::Arc;
 
 use crate::*;
-use resource::ResourcePool;
 
 struct PerFrame {
     graphics_cmd_pools: Vec<CommandPool>,
     compute_cmd_pools: Vec<CommandPool>,
     transfer_cmd_pools: Vec<CommandPool>,
 
-    used_vbo_blocks: Vec<BufferBlock>,
-    used_ibo_blocks: Vec<BufferBlock>,
-    used_ubo_blocks: Vec<BufferBlock>,
-    used_staging_blocks: Vec<BufferBlock>,
+    used_vbo_blocks: Vec<BufferBlockHandle>,
+    used_ibo_blocks: Vec<BufferBlockHandle>,
+    used_ubo_blocks: Vec<BufferBlockHandle>,
+    used_staging_blocks: Vec<BufferBlockHandle>,
 }
 
 /// The Device. Owns and manages resources, submission, etc.
@@ -33,65 +34,130 @@ pub struct Device {
     multiple_queue_families: bool,
 
     memory_properties: vk::PhysicalDeviceMemoryProperties,
+    device_properties: vk::PhysicalDeviceProperties,
 
-    resources: ResourcePool,
-    per_frame: Vec<PerFrame>,
+    resources: RwLock<ResourceSet>,
+    blocks: RwLock<BufferBlockSet>,
 
-    vbo_pool: BufferBlockPool,
-    ibo_pool: BufferBlockPool,
-    ubo_pool: BufferBlockPool,
-    staging_pool: BufferBlockPool,
+    per_frame: Vec<RwLock<PerFrame>>,
+    current_frame_index: usize,
+    vbo_upload_queue: RwLock<Vec<BufferBlockHandle>>,
+    ibo_upload_queue: RwLock<Vec<BufferBlockHandle>>,
+    ubo_upload_queue: RwLock<Vec<BufferBlockHandle>>,
 }
 
 impl Device {
+    /// Acquire a read-only handle to this device's ResourceSet.
+    pub fn resources(&self) -> RwLockReadGuard<'_, ResourceSet> {
+        self.resources.read()
+    }
+
+    /// Acquire a writable handle to this device's ResourceSet.
+    pub fn resources_mut(&self) -> RwLockWriteGuard<'_, ResourceSet> {
+        self.resources.write()
+    }
+
+    /// Acquire a read-only handle to this device's `BufferBlockSet`
+    pub fn buffer_blocks(&self) -> RwLockReadGuard<'_, BufferBlockSet> {
+        self.blocks.read()
+    }
+
+    /// Acquire a writable handle to this device's `BufferBlockSet`
+    pub fn buffer_blocks_mut(&self) -> RwLockWriteGuard<'_ , BufferBlockSet> {
+        self.blocks.write()
+    }
+
     /// Request a BufferBlock which will allocate buffers that may be used as vertex buffers.
     ///
     /// The BufferBlock will be automatically recycled or destroyed the next time this frame
-    /// begins.
+    /// begins, and any data written to it will be automatically uploaded upon the next
+    /// graphics or compute submission.
     pub fn request_vertex_block(
-        &mut self,
+        &self,
         size: usize,
         tag: Option<Tag>
-    ) -> Result<BufferBlock, vk_mem::Error> {
-        self.vbo_pool.request_block(&self.allocator, size, tag)
+    ) -> Result<BufferBlockHandle, vk_mem::Error> {
+        let pool = &mut self.buffer_blocks_mut().vbo_pool;
+
+        let handle = pool.request_block(size, tag)?;
+
+        self.per_frame[self.current_frame_index].write().used_vbo_blocks.push(handle);
+
+        let block = pool.get_block(handle).unwrap();
+
+        if block.requires_upload() {
+            self.vbo_upload_queue.write().push(handle);
+        }
+
+        Ok(handle)
     }
 
     /// Request a BufferBlock which will allocate buffers that may be used as index buffers.
     ///
     /// The BufferBlock will be automatically recycled or destroyed the next time this frame
-    /// begins.
+    /// begins, and any data written to it will be automatically uploaded upon the next
+    /// graphics or compute submission.
     pub fn request_index_block(
-        &mut self,
+        &self,
         size: usize,
         tag: Option<Tag>
-    ) -> Result<BufferBlock, vk_mem::Error> {
-        self.ibo_pool.request_block(&self.allocator, size, tag)
+    ) -> Result<BufferBlockHandle, vk_mem::Error> {
+        let pool = &mut self.buffer_blocks_mut().ibo_pool;
+
+        let handle = pool.request_block(size, tag)?;
+
+        self.per_frame[self.current_frame_index].write().used_ibo_blocks.push(handle);
+
+        let block = pool.get_block(handle).unwrap();
+
+        if block.requires_upload() {
+            self.ibo_upload_queue.write().push(handle);
+        }
+
+        Ok(handle)
     }
 
     /// Request a BufferBlock which will allocate buffers that may be used as uniform buffers.
     ///
     /// The BufferBlock will be automatically recycled or destroyed the next time this frame
-    /// begins.
+    /// begins, and any data written to it will be automatically uploaded upon the next
+    /// graphics or compute submission.
     pub fn request_uniform_block(
-        &mut self,
+        &self,
         size: usize,
         tag: Option<Tag>
-    ) -> Result<BufferBlock, vk_mem::Error> {
-        self.ubo_pool.request_block(&self.allocator, size, tag)
+    ) -> Result<BufferBlockHandle, vk_mem::Error> {
+        let pool = &mut self.buffer_blocks_mut().ubo_pool;
+
+        let handle = pool.request_block(size, tag)?;
+
+        self.per_frame[self.current_frame_index].write().used_ubo_blocks.push(handle);
+
+        let block = pool.get_block(handle).unwrap();
+
+        if block.requires_upload() {
+            self.ubo_upload_queue.write().push(handle);
+        }
+
+        Ok(handle)
     }
 
     /// Request a BufferBlock which will allocate buffers that may be used as staging buffers,
-    /// i.e. buffers with TRANSFER_SRC usage whose data may be copied to a persistent GPU side
-    /// buffer.
+    /// i.e. buffers that are mapped on CPU side with TRANSFER_SRC usage whose data may be copied
+    /// to a persistent GPU side buffer or image.
     ///
     /// The BufferBlock will be automatically recycled or destroyed the next time this frame
-    /// begins.
+    /// begins, but it **will not** automatically be synchronized. Use the `Device::submit_staging`
+    /// method to aid in this regard.
     pub fn request_staging_block(
-        &mut self,
+        &self,
         size: usize,
         tag: Option<Tag>
-    ) -> Result<BufferBlock, vk_mem::Error> {
-        self.staging_pool.request_block(&self.allocator, size, tag)
+    ) -> Result<BufferBlockHandle, vk_mem::Error> {
+        let handle = self.buffer_blocks_mut().staging_pool.request_block(size, tag)?;
+
+        self.per_frame[self.current_frame_index].write().used_staging_blocks.push(handle);
+        Ok(handle)
     }
 
     /// Get the raw `vk_mem::Allocator`.
@@ -99,9 +165,19 @@ impl Device {
         &self.allocator
     }
 
+    /// Get the raw `ash::Device`.
+    pub fn raw_device(&self) -> &ash::Device {
+        &self.device
+    }
+
     /// Get the `vk::PhysicalDeviceMemoryProperties` for the physical device of this Device.
-    pub fn get_physical_device_memory_properties(&self) -> vk::PhysicalDeviceMemoryProperties {
-        unsafe { self.instance.get_physical_device_memory_properties(self.physical_device) }
+    pub fn memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {
+        &self.memory_properties
+    }
+
+    /// Get the `vk::PhysicalDeviceProperties` for the physical device of this Device.
+    pub fn device_properties(&self) -> &vk::PhysicalDeviceProperties {
+        &self.device_properties
     }
 
     /// Find whether a certain memory type index is visible to the cpu, i.e. able to be mapped.
@@ -118,6 +194,20 @@ impl Device {
         ty.property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) 
     }
 
+    /// Destroy the buffer referred to by `buffer`.
+    pub fn destroy_buffer(&self, buffer: BufferHandle) {
+        self.resources.write().buffers.remove(buffer.idx);
+    }
+
+    /// Destroy the buffer view referred to by `buffer_view`.
+    pub fn destroy_buffer_view(&self, buffer_view: BufferViewHandle) {
+        self.resources.write().buffers.remove(buffer_view.idx);
+    }
+
+    /// Destroy the image referred to by `image`.
+    pub fn destroy_image(&self, image: ImageHandle) {
+        self.resources.write().images.remove(image.idx);
+    }
 
     /// Create a Buffer from a BufferCreateInfo and, optionally, upload some
     /// initial data to it.
@@ -128,11 +218,11 @@ impl Device {
     ///
     /// If `initial_data` exists, `size_of::<T>` must be <= to `create_info.size`.
     pub fn create_buffer<T>(
-        &mut self,
+        self: Arc<Self>,
         mut create_info: BufferCreateInfo,
         tag: Option<Tag>,
         initial_data: Option<T>
-    ) -> Result<Buffer, vk_mem::Error> {
+    ) -> Result<BufferHandle, vk_mem::Error> {
         if initial_data.is_some() {
             assert!(core::mem::size_of::<T>() as vk::DeviceSize <= create_info.size);
         }
@@ -149,18 +239,20 @@ impl Device {
 
         let mapped_data = std::ptr::NonNull::new(allocation_info.get_mapped_data());
 
-        let handle = Buffer {
+        let handle = BufferHandle {
             idx: self
                 .resources
+                .write()
                 .buffers
-                .insert(OwnedBuffer::new(
+                .insert(unsafe { Buffer::new(
+                    self.clone(),
                     buffer,
                     allocation,
                     allocation_info,
                     create_info,
                     mapped_data,
                     tag.clone(),
-                )),
+                ) }),
         };
 
         if let Some(initial_data) = initial_data {
@@ -208,11 +300,11 @@ impl Device {
 
     /// Create a Buffer from a BufferCreateInfo into a specific pool
     pub fn create_buffer_in(
-        &mut self,
+        self: Arc<Self>,
         create_info: BufferCreateInfo,
         pool: vk_mem::AllocatorPool,
         tag: Option<Tag>,
-    ) -> Result<Buffer, vk_mem::Error> {
+    ) -> Result<BufferHandle, vk_mem::Error> {
         let mut queue_family_indices = [0u32; 3];
         let buffer_info = self.raw_buffer_create_info(create_info, &mut queue_family_indices);
 
@@ -227,35 +319,21 @@ impl Device {
 
         let mapped_data = std::ptr::NonNull::new(allocation_info.get_mapped_data());
 
-        Ok(Buffer {
+        Ok(BufferHandle {
             idx: self
                 .resources
+                .write()
                 .buffers
-                .insert(OwnedBuffer::new(
+                .insert(unsafe { Buffer::new(
+                    self.clone(),
                     buffer,
                     allocation,
                     allocation_info,
                     create_info,
                     mapped_data,
                     tag
-                )),
+                ) }),
         })
-    }
-
-    /// Get a shared reference to the owned buffer behind a given handle, if
-    /// it still exists.
-    pub fn get_buffer(&self, buffer: Buffer) -> Option<&OwnedBuffer> {
-        self.resources
-            .buffers
-            .get(buffer.idx)
-    }
-
-    /// Get an exclusive reference to the owned buffer behind a given handle, if
-    /// it still exists.
-    pub fn get_buffer_mut(&mut self, buffer: Buffer) -> Option<&mut OwnedBuffer> {
-        self.resources
-            .buffers
-            .get_mut(buffer.idx)
     }
 
     /// Create the corresponding `vk_mem::AllocationCreateInfo` for a specified `BufferCreateInfo`

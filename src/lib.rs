@@ -22,6 +22,7 @@ pub use image::*;
 
 /// Resource management.
 pub mod resource;
+pub use resource::*;
 
 /// Utilities for working with Vulkan Formats.
 pub mod format;
@@ -30,7 +31,10 @@ pub mod format;
 pub mod device;
 pub use device::*;
 
+#[allow(unused_macros)]
+#[allow(unused_imports)]
 mod util;
+
 /// A type that panics on Drop and requires manual destruction.
 pub mod nodrop;
 pub use nodrop::*;

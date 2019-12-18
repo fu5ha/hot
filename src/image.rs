@@ -1,8 +1,11 @@
 use ash::vk;
 use bitflags::bitflags;
-use generational_arena as ga;
+use derivative::Derivative;
 
+use crate::*;
 use crate::format::format_has_depth_or_stencil_aspect;
+
+use std::sync::Arc;
 
 /// Initial data for an Image.
 pub struct InitialImageData<'a> {
@@ -42,7 +45,7 @@ bitflags! {
 #[derive(Clone, Copy, Debug)]
 pub struct ImageViewCreateInfo {
     /// The image being viewed.
-    pub image: Image,
+    pub image: ImageHandle,
     /// The format to interpret the image as.
     pub format: vk::Format,
     /// The base mip level to view.
@@ -59,15 +62,9 @@ pub struct ImageViewCreateInfo {
     pub swizzle: vk::ComponentMapping,
 }
 
-/// A handle to an image view.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct ImageView {
-    idx: ga::Index,
-}
-
 /// An owned ImageView and associated data. Must be manually destroyed and not be dropped.
 #[derive(Debug)]
-pub struct OwnedImageView {
+pub struct ImageView {
     view: vk::ImageView,
     render_target_views: Vec<vk::ImageView>,
     depth_view: vk::ImageView,
@@ -77,7 +74,7 @@ pub struct OwnedImageView {
     create_info: ImageViewCreateInfo,
 }
 
-impl Drop for OwnedImageView {
+impl Drop for ImageView {
     fn drop(&mut self) {
         panic!("OwnedImage dropped: {:?}", self);
     }
@@ -211,12 +208,6 @@ impl ImageCreateInfo {
     }
 }
 
-/// Handle to a GPU image.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct Image {
-    idx: ga::Index,
-}
-
 /// The type of layout that this image is in. Can either be the optimal
 /// layout for a given access type or the General layout which is usable for
 /// any access.
@@ -240,27 +231,76 @@ impl ImageLayoutType {
     }
 }
 
-/// An owned Image and associated data. Must be manually destroyed and not be dropped.
-#[derive(Debug)]
-pub struct OwnedImage {
+/// An owned Image and associated data.
+///
+/// Will be automatically destroyed on Drop. Will also destroy associated ImageView(s) that were
+/// automatically created.
+#[derive(Derivative)]
+#[derivative(Debug)]
+pub struct Image {
     image: vk::Image,
-    alloc: vk_mem::Allocation,
-    alloc_info: vk_mem::AllocationInfo,
+    allocation: vk_mem::Allocation,
+    allocation_info: vk_mem::AllocationInfo,
     create_info: ImageCreateInfo,
     view: Option<ImageView>,
     layout_type: ImageLayoutType,
     stage_flags: vk::PipelineStageFlags,
     access_flags: vk::AccessFlags,
     swapchain_layout: vk::ImageLayout,
+    tag: Option<Tag>,
+    #[derivative(Debug = "ignore")]
+    device: Arc<Device>,
 }
 
-impl Drop for OwnedImage {
+impl Drop for Image {
     fn drop(&mut self) {
-        panic!("OwnedImage dropped: {:?}", self);
+        // Destroy the image view(s) first by dropping the owned ImageView struct.
+        let _ = self.view.take();
+
+        if let Err(e) = self.device.raw_allocator().destroy_image(self.image, &self.allocation) {
+            if let Some(ref tag) = self.tag {
+                panic!("OwnedBuffer with tag {} errored on destruction: {:#?}", tag, e);
+            } else {
+                panic!("Generic (untagged) Buffer errored on destruction: {:#?}", e);
+            }
+        }
     }
 }
 
-impl OwnedImage {
+impl Image {
+    /// Create a new owned Image. You probably want to use `Device::create_image` instead.
+    ///
+    /// # Safety
+    ///
+    /// `device` must be the Device that this Image was allocated from.
+    pub(crate) unsafe fn new(
+        device: Arc<Device>,
+        image: vk::Image,
+        allocation: vk_mem::Allocation,
+        allocation_info: vk_mem::AllocationInfo,
+        create_info: ImageCreateInfo,
+        view: Option<ImageView>,
+        layout_type: ImageLayoutType,
+        stage_flags: vk::PipelineStageFlags,
+        access_flags: vk::AccessFlags,
+        swapchain_layout: vk::ImageLayout,
+        tag: Option<Tag>,
+    ) -> Self {
+        Self {
+            image,
+            allocation,
+            allocation_info,
+            create_info,
+            view,
+            layout_type,
+            stage_flags,
+            access_flags,
+            swapchain_layout,
+            tag,
+            device: device.clone(),
+        }
+    }
+
     /// Get the width of this image.
     pub fn width(&self) -> usize {
         self.create_info.width

@@ -2,42 +2,79 @@ use ash::vk;
 
 use generational_arena as ga;
 
+use derivative::Derivative;
+
 use thiserror::Error;
 
-use crate::{OwnedBuffer, BufferCreateInfo, BufferUsageDomain, Device, NoDrop, Tag};
+use crate::*;
 
 use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 static BUFFER_BLOCK_POOL_UUID: AtomicUsize = AtomicUsize::new(0);
 
-/// A handle to a GPU Buffer allocated from a BufferBlock.
-pub struct BufferBlockBuffer {
-    block: BufferBlock,
+/// A handle to a GPU Buffer allocated from a linear BufferBlock
+pub struct TransientBufferHandle {
+    block: BufferBlockHandle,
     gpu_idx: ga::Index,
     cpu_idx: Option<ga::Index>,
 }
 
-/// An owned BufferBlock which contains the actual vk_mem::AllocatorPool(s) that back it,
-/// as well as owns all the sub Buffers that have been allocated from it.
-#[derive(Debug)]
-pub struct OwnedBufferBlock {
-    pub(crate) self_id: Option<BufferBlock>,
+/// A block of Buffers which are linearly allocated and intended to be basically disposable
+/// and used for only one frame before being recycled. It is meant to provide ease of use for such operations,
+/// and so supports CPU side upload as a first class concern.
+///
+/// Generally you will not need to create your own BufferBlock but will rather want use the
+/// `CommandBuffer::allocate_<kind>_data` methods.
+#[derive(Derivative)]
+#[derivative(Debug)]
+pub struct BufferBlock {
+    pub(crate) self_id: Option<BufferBlockHandle>,
     pub(crate) gpu: vk_mem::AllocatorPool,
     pub(crate) cpu: Option<vk_mem::AllocatorPool>,
-    pub(crate) allocated_buffers: ga::Arena<OwnedBuffer>,
+    pub(crate) allocated_buffers: ga::Arena<Buffer>,
     pub(crate) usage: vk::BufferUsageFlags,
     pub(crate) domain: BufferUsageDomain,
     pub(crate) size: usize,
-    pub(crate) nodrop: NoDrop,
+    pub(crate) tag: Option<Tag>,
+    #[derivative(Debug = "ignore")]
+    pub(crate) device: Arc<Device>,
 }
 
-impl OwnedBufferBlock {
+impl Drop for BufferBlock {
+    fn drop(&mut self) {
+        self.reset();
+        if let Err(e) = self.device.raw_allocator().destroy_pool(&self.gpu) {
+            if let Some(ref tag) = self.tag {
+                panic!("BufferBlock with tag {} errored on destruction: {:#?}", tag, e);
+            } else {
+                panic!("Generic (untagged) BufferBlock errored on destruction: {:#?}", e);
+            }
+        }
+        if let Some(ref cpu_pool) = self.cpu {
+            if let Err(e) = self.device.raw_allocator().destroy_pool(cpu_pool) {
+                if let Some(ref tag) = self.tag {
+                    panic!("BufferBlock with tag {} errored on destruction: {:#?}", tag, e);
+                } else {
+                    panic!("Generic (untagged) BufferBlock errored on destruction: {:#?}", e);
+                }
+            }
+        }
+    }
+}
+
+impl BufferBlock {
     /// Create a new OwnedBufferBlock.
-    pub fn new(
-        self_id: Option<BufferBlock>,
+    ///
+    /// # Safety
+    ///
+    /// `device` must be the Device used to allocate the associated AllocatorPools.
+    pub unsafe fn new(
+        device: Arc<Device>,
+        self_id: Option<BufferBlockHandle>,
         gpu: vk_mem::AllocatorPool,
         cpu: Option<vk_mem::AllocatorPool>,
-        allocated_buffers: ga::Arena<OwnedBuffer>,
+        allocated_buffers: ga::Arena<Buffer>,
         usage: vk::BufferUsageFlags,
         domain: BufferUsageDomain,
         size: usize,
@@ -51,16 +88,18 @@ impl OwnedBufferBlock {
             usage,
             domain,
             size,
-            nodrop: if let Some(tag) = tag {
-                NoDrop::new(tag)
-            } else {
-                NoDrop::from_str("Generic OwnedBufferBlock")
-            },
+            tag,
+            device,
         }
     }
 
-    /// Get a shared reference to the GPU-side buffer referenced by a `BufferBlockBuffer` created from this `BufferBlock`.
-    pub fn get_gpu_buffer(&self, buffer: BufferBlockBuffer) -> Option<&OwnedBuffer> {
+    /// Get whether this pool requires data to be uploaded.
+    pub fn requires_upload(&self) -> bool {
+        self.cpu.is_some()
+    }
+
+    /// Get a shared reference to the GPU-side buffer referenced by a `TransientBufferHandle` created from this `BufferBlock`.
+    pub fn get_gpu_buffer(&self, buffer: TransientBufferHandle) -> Option<&Buffer> {
         if buffer.block == self.self_id.unwrap() {
             return self.allocated_buffers.get(buffer.gpu_idx);
         }
@@ -68,8 +107,8 @@ impl OwnedBufferBlock {
         None
     }
 
-    /// Get a mutable reference to the GPU-side buffer referenced by a `BufferBlockBuffer` created from this `BufferBlock`.
-    pub fn get_gpu_buffer_mut(&mut self, buffer: BufferBlockBuffer) -> Option<&mut OwnedBuffer> {
+    /// Get a mutable reference to the GPU-side buffer referenced by a `TransientBufferHandle` created from this `BufferBlock`.
+    pub fn get_gpu_buffer_mut(&mut self, buffer: TransientBufferHandle) -> Option<&mut Buffer> {
         if buffer.block == self.self_id.unwrap() {
             return self.allocated_buffers.get_mut(buffer.gpu_idx);
         }
@@ -77,9 +116,9 @@ impl OwnedBufferBlock {
         None
     }
 
-    /// Get a shared reference to the CPU-side buffer referenced by a `BufferBlockBuffer` created from this `BufferBlock`,
+    /// Get a shared reference to the CPU-side buffer referenced by a `TransientBufferHandle` created from this `BufferBlock`,
     /// if there is one.
-    pub fn get_cpu_buffer(&self, buffer: BufferBlockBuffer) -> Option<&OwnedBuffer> {
+    pub fn get_cpu_buffer(&self, buffer: TransientBufferHandle) -> Option<&Buffer> {
         if buffer.block == self.self_id.unwrap() {
             if let Some(cpu_idx) = buffer.cpu_idx {
                 return self.allocated_buffers.get(cpu_idx);
@@ -89,9 +128,9 @@ impl OwnedBufferBlock {
         None
     }
 
-    /// Get a mutable reference to the CPU-side buffer referenced by a `BufferBlockBuffer` created from this `BufferBlock,
+    /// Get a mutable reference to the CPU-side buffer referenced by a `TransientBufferHandle` created from this `BufferBlock`,
     /// if there is one.
-    pub fn get_cpu_buffer_mut(&mut self, buffer: BufferBlockBuffer) -> Option<&mut OwnedBuffer> {
+    pub fn get_cpu_buffer_mut(&mut self, buffer: TransientBufferHandle) -> Option<&mut Buffer> {
         if buffer.block == self.self_id.unwrap() {
             if let Some(cpu_idx) = buffer.cpu_idx {
                 return self.allocated_buffers.get_mut(cpu_idx);
@@ -104,14 +143,14 @@ impl OwnedBufferBlock {
     /// Allocate a buffer from the block. The buffer is allocated in a linear fashion, making allocation very fast.
     pub fn allocate_buffer(
         &mut self,
-        device: &Device,
+        device: Arc<Device>,
         size: usize,
         tag: Option<Tag>,
-    ) -> Result<BufferBlockBuffer, vk_mem::Error> {
+    ) -> Result<TransientBufferHandle, vk_mem::Error> {
         let create_info = 
             BufferCreateInfo {
                 size: size as _,
-                usage: self.usage,
+                usage: self.usage | vk::BufferUsageFlags::TRANSFER_DST,
                 domain: self.domain,
             };
 
@@ -131,14 +170,15 @@ impl OwnedBufferBlock {
 
         let gpu_idx = self
             .allocated_buffers
-            .insert(OwnedBuffer::new(
+            .insert(unsafe { Buffer::new(
+                device.clone(),
                 buffer,
                 allocation,
                 allocation_info,
                 create_info,
                 mapped_data,
                 tag.clone(),
-            ));
+            ) });
 
         
         let cpu_idx = if self.cpu.is_some() {
@@ -163,43 +203,37 @@ impl OwnedBufferBlock {
 
             Some(self
                 .allocated_buffers
-                .insert(OwnedBuffer::new(
+                .insert(unsafe { Buffer::new(
+                    device.clone(),
                     buffer,
                     allocation,
                     allocation_info,
                     create_info,
                     mapped_data,
                     tag.clone()
-                )))
+                ) }))
             
         } else {
             None
         };
 
-        Ok(BufferBlockBuffer {
+        Ok(TransientBufferHandle {
             block: self.self_id.unwrap(),
             gpu_idx,
             cpu_idx
         })
     }
 
-    /// Resets the block by destryoing all `BufferBlockBuffer`s that were allocated from the block.
-    pub fn reset(&mut self, device: &Device) -> Result<(), vk_mem::Error> {
-        for (_, owned_buffer) in self.allocated_buffers.drain() {
-            owned_buffer.destroy(device)?;
-        }
-        Ok(())
+    /// Resets the block by destroying all buffers that were allocated from the block.
+    pub fn reset(&mut self) {
+        // Destroy all current buffers by dropping them.
+        for (_, _owned_buffer) in self.allocated_buffers.drain() {}
     }
 }
 
-/// A block of Buffers which is intended to be basically disposable and used for only one
-/// frame before being recycled. It is meant to provide ease of use for such operations,
-/// and so supports CPU side upload as a first class concern.
-///
-/// Either a CPU-visible, GPU-owned buffer with data or a GPU-only buffer
-/// and an associated CPU staging buffer for copying data into it.
+/// An untyped handle to a BufferBlock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BufferBlock {
+pub struct BufferBlockHandle {
     pool_uuid: usize,
     idx: ga::Index,
 }
@@ -208,10 +242,11 @@ pub struct BufferBlock {
 ///
 /// Blocks will attempt to be recycled and reused according to the description in `new`.
 pub struct BufferBlockPool {
+    device: Arc<Device>,
     uuid: usize,
 
-    owned_blocks: ga::Arena<OwnedBufferBlock>,
-    recycled_blocks: Vec<OwnedBufferBlock>,
+    owned_blocks: ga::Arena<BufferBlock>,
+    recycled_blocks: Vec<BufferBlock>,
 
     gpu_memory_type_index: u32,
     cpu_memory_type_index: Option<u32>,
@@ -235,8 +270,8 @@ impl BufferBlockPool {
     /// this pool will have.
     /// * `requires_device_local_memory`: Whether this pool requires its memory to be on the GPU. If so, staging buffers may need
     /// to be used in order to copy data into the final GPU-side buffer.
-    pub fn new(
-        device: &Device,
+    pub(crate) fn new(
+        device: Arc<Device>,
         block_size: usize,
         usage: vk::BufferUsageFlags,
         requires_device_local_memory: bool,
@@ -274,6 +309,7 @@ impl BufferBlockPool {
         };
 
         Ok(Self {
+            device,
             uuid,
             owned_blocks: ga::Arena::new(),
             recycled_blocks: Vec::new(),
@@ -287,7 +323,7 @@ impl BufferBlockPool {
     }
 
     /// Get a shared reference to the `OwnedBufferBlock` referenced by a `BufferBlock`.
-    pub fn get_block(&self, block: BufferBlock) -> Option<&OwnedBufferBlock> {
+    pub fn get_block(&self, block: BufferBlockHandle) -> Option<&BufferBlock> {
         if block.pool_uuid != self.uuid {
             return None;
         }
@@ -296,7 +332,7 @@ impl BufferBlockPool {
     }
 
     /// Get a mutable reference to the `OwnedBufferBlock` referenced by a `BufferBlock`.
-    pub fn get_block_mut(&mut self, block: BufferBlock) -> Option<&mut OwnedBufferBlock> {
+    pub fn get_block_mut(&mut self, block: BufferBlockHandle) -> Option<&mut BufferBlock> {
         if block.pool_uuid != self.uuid {
             return None;
         }
@@ -312,15 +348,14 @@ impl BufferBlockPool {
     /// * `min_size`: The minimum size that must be allocated for the block.
     pub fn request_block(
         &mut self,
-        allocator: &vk_mem::Allocator,
         min_size: usize,
         tag: Option<Tag>,
-    ) -> Result<BufferBlock, vk_mem::Error> {
+    ) -> Result<BufferBlockHandle, vk_mem::Error> {
         if min_size <= self.block_size {
             if let Some(block) = self.recycled_blocks.pop() {
                 let block_idx = self.owned_blocks.insert(block);
 
-                let block = BufferBlock {
+                let block = BufferBlockHandle {
                     pool_uuid: self.uuid,
                     idx: block_idx,
                 };
@@ -331,7 +366,7 @@ impl BufferBlockPool {
             }
         }
 
-        self.allocate_block(allocator, min_size, tag)
+        self.allocate_block(min_size, tag)
     }
 
     /// Allocate a new BufferBlock from the pool. Will not attempt to reuse a previously allocated recycled Block.
@@ -341,10 +376,9 @@ impl BufferBlockPool {
     /// * `min_size`: The minimum size that must be allocated for the block.
     pub fn allocate_block(
         &mut self,
-        allocator: &vk_mem::Allocator,
         min_size: usize,
         tag: Option<Tag>,
-    ) -> Result<BufferBlock, vk_mem::Error> {
+    ) -> Result<BufferBlockHandle, vk_mem::Error> {
         let block_size = if min_size <= self.block_size {
             self.block_size
         } else {
@@ -360,17 +394,18 @@ impl BufferBlockPool {
             ..Default::default()
         };
 
-        let gpu = allocator.create_pool(&pool_info)?;
+        let gpu = self.device.raw_allocator().create_pool(&pool_info)?;
 
         let cpu = if let Some(cpu_memory_type_index) = self.cpu_memory_type_index {
             pool_info.memory_type_index = cpu_memory_type_index;
 
-            Some(allocator.create_pool(&pool_info)?)
+            Some(self.device.raw_allocator().create_pool(&pool_info)?)
         } else {
             None
         };
 
-        let block_idx = self.owned_blocks.insert(OwnedBufferBlock::new(
+        let block_idx = self.owned_blocks.insert(unsafe { BufferBlock::new(
+            self.device.clone(),
             None,
             gpu,
             cpu,
@@ -379,9 +414,9 @@ impl BufferBlockPool {
             self.domain,
             block_size,
             tag,
-        ));
+        ) });
 
-        let block = BufferBlock {
+        let block = BufferBlockHandle {
             pool_uuid: self.uuid,
             idx: block_idx,
         };
@@ -397,7 +432,7 @@ impl BufferBlockPool {
     /// have the same size as the default block size as this pool. If one of these conditions is
     /// not met, the function will return an error. If a block is not successfully recycled, you must
     /// manually destroy it by calling `destroy_block` on the pool it was created from.
-    pub fn recycle_block(&mut self, device: &Device, block: BufferBlock) -> Result<(), BlockRecycleError> {
+    pub fn recycle_block(&mut self, block: BufferBlockHandle) -> Result<(), BlockRecycleError> {
         if block.pool_uuid != self.uuid {
             return Err(BlockRecycleError::WrongPool);
         }
@@ -411,7 +446,7 @@ impl BufferBlockPool {
         }
 
         let mut owned_block = self.owned_blocks.remove(block.idx).unwrap();
-        owned_block.reset(device)?;
+        owned_block.reset();
         owned_block.self_id = None;
         self.recycled_blocks.push(owned_block);
 
@@ -431,13 +466,4 @@ pub enum BlockRecycleError {
     /// The block was already either recycled or deleted.
     #[error("block was already recycled or deleted")]
     AlreadyFreed,
-    /// There was an error while destroying a contained buffer
-    #[error("error destroying contained buffer")]
-    DestructionError(vk_mem::Error)
-}
-
-impl From<vk_mem::Error> for BlockRecycleError {
-    fn from(e: vk_mem::Error) -> Self {
-        Self::DestructionError(e)
-    }
 }

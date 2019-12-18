@@ -1,10 +1,13 @@
 pub use ash::vk;
+use ash::version::DeviceV1_0;
 
-use generational_arena as ga;
+use derivative::Derivative;
+
 
 use std::ptr::NonNull;
+use std::sync::Arc;
 
-use crate::{Device, NoDrop, Tag};
+use crate::{Device, Tag, resource::*};
 
 /// The general memory 'domain' a buffer should be placed in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -27,7 +30,7 @@ pub enum BufferUsageDomain {
     Readback,
 }
 
-/// Information needed to create a Buffer.
+/// Information needed to create a buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct BufferCreateInfo {
     /// The memory domain into which the buffer should be placed.
@@ -38,28 +41,31 @@ pub struct BufferCreateInfo {
     pub usage: vk::BufferUsageFlags,
 }
 
-/// Handle to a GPU Buffer.
-#[derive(Clone, Copy, Debug)]
-pub struct Buffer {
-    pub(crate) idx: ga::Index,
-}
-
 /// An owned `vk::Buffer` and some associated information.
 ///
-/// Must not be simply Dropped, but rather destroyed manually.
-#[derive(Debug)]
-pub struct OwnedBuffer {
+/// Will be automatically destroyed on Drop, though it must not outlife the Device it was
+/// created from.
+#[derive(Derivative)]
+#[derivative(Debug)]
+pub struct Buffer {
     pub(crate) buffer: vk::Buffer,
     pub(crate) allocation: vk_mem::Allocation,
     pub(crate) allocation_info: vk_mem::AllocationInfo,
     pub(crate) create_info: BufferCreateInfo,
     pub(crate) mapped_data: Option<NonNull<u8>>,
-    pub(crate) nodrop: NoDrop,
+    pub(crate) tag: Option<Tag>,
+    #[derivative(Debug = "ignore")]
+    pub(crate) device: Arc<Device>,
 }
 
-impl OwnedBuffer {
-    /// Create a new OwnedBuffer.
-    pub fn new(
+impl Buffer {
+    /// Create a new owned Buffer. You probably want `Device::create_buffer` instead.
+    ///
+    /// # Safety
+    ///
+    /// `device` must be an Arc to the `Device` that this buffer was allocated from.
+    pub(crate) unsafe fn new(
+        device: Arc<Device>,
         buffer: vk::Buffer,
         allocation: vk_mem::Allocation,
         allocation_info: vk_mem::AllocationInfo,
@@ -73,11 +79,8 @@ impl OwnedBuffer {
             allocation_info,
             create_info,
             mapped_data,
-            nodrop: if let Some(tag) = tag {
-                NoDrop::new(tag)
-            } else {
-                NoDrop::from_str("Generic OwnedBuffer")
-            },
+            tag,
+            device,
         }
     }
 
@@ -91,27 +94,32 @@ impl OwnedBuffer {
         &self.allocation
     }
 
-    /// The `vk_mem::AllocationInfo` used to create this Buffer.
+    /// The `vk_mem::AllocationInfo` used to create this buffer.
     pub fn allocation_info(&self) -> &vk_mem::AllocationInfo {
         &self.allocation_info
     }
 
-    /// The BufferCreateInfo used to create this Buffer.
+    /// The BufferCreateInfo used to create this buffer.
     pub fn create_info(&self) -> BufferCreateInfo {
         self.create_info
     }
 
-    /// A NonNull pointer to the CPU mapped data of this Buffer, if
+    /// A NonNull pointer to the CPU mapped data of this buffer, if
     /// it exists.
     pub fn mapped_data(&mut self) -> Option<&mut NonNull<u8>> {
         self.mapped_data.as_mut()
     }
+}
 
-    /// Destroy this buffer.
-    pub fn destroy(self, device: &Device) -> Result<(), vk_mem::Error> {
-        device.raw_allocator().destroy_buffer(self.buffer, &self.allocation)?;
-        self.nodrop.destroy();
-        Ok(())
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        if let Err(e) = self.device.raw_allocator().destroy_buffer(self.buffer, &self.allocation) {
+            if let Some(ref tag) = self.tag {
+                panic!("OwnedBuffer with tag {} errored on destruction: {:#?}", tag, e);
+            } else {
+                panic!("Generic (untagged) Buffer errored on destruction: {:#?}", e);
+            }
+        }
     }
 }
 
@@ -126,19 +134,46 @@ pub struct BufferViewCreateInfo {
     pub range: vk::DeviceSize,
 }
 
-/// Handle to a GPU BufferView.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct BufferView {
-    idx: ga::Index,
-}
-
 /// An owned `vk::BufferView` and some associated information.
-#[derive(Debug)]
-pub struct OwnedBufferView {
-    pub(crate) buffer: Buffer,
+///
+/// Will automatically be destroyed on Drop, though it must not outlive the
+/// Device it was allocated from.
+#[derive(Derivative)]
+#[derivative(Debug)]
+pub struct BufferView {
+    pub(crate) buffer: BufferHandle,
     pub(crate) view: vk::BufferView,
     pub(crate) create_info: BufferViewCreateInfo,
-    pub(crate) nodrop: NoDrop,
+    pub(crate) tag: Option<Tag>,
+    #[derivative(Debug = "ignore")]
+    pub(crate) device: Arc<Device>,
+}
+
+impl BufferView {
+    /// Create a new OwnedBufferView.
+    pub(crate) unsafe fn new(
+        device: Arc<Device>,
+        buffer: BufferHandle,
+        view: vk::BufferView,
+        create_info: BufferViewCreateInfo,
+        tag: Option<Tag>,
+    ) -> Self {
+        BufferView {
+            buffer,
+            view,
+            create_info,
+            tag,
+            device,
+        }
+    }
+}
+
+impl Drop for BufferView {
+    fn drop(&mut self) {
+        // safe since we must guarantee upon creation that device is the one used to allocate
+        // this resource on.
+        unsafe { self.device.raw_device().destroy_buffer_view(self.view, None) };
+    }
 }
 
 /// Get all possible `vk::PipelineStageFlags` given a set of `vk::BufferUsageFlags`.
